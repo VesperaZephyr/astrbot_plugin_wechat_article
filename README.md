@@ -3,12 +3,12 @@
 <div align="center">
 
 ![AstrBot](https://img.shields.io/badge/AstrBot-Plugin-blue.svg)
-![Version](https://img.shields.io/badge/Version-1.2.0-green.svg)
+![Version](https://img.shields.io/badge/Version-1.3.0-green.svg)
 ![License](https://img.shields.io/badge/License-MIT-orange.svg)
 ![Author](https://img.shields.io/badge/Author-VesperaZephyr-purple.svg)
 
 专为 **[AstrBot](https://github.com/Soulter/AstrBot)** 打造的微信公众号（mp.weixin.qq.com）全文精读插件。  
-彻底解决传统解析器**数学公式丢失空白、排版崩塌、长文刷屏**的痛点。
+解决传统解析器**数学公式丢失空白、排版崩塌、长文刷屏**等痛点，支持**无公式秒回纯文本**与**有公式高保真长图**智能自适应。
 
 </div>
 
@@ -16,21 +16,24 @@
 
 ## ✨ 核心特性
 
-- 📐 **数学公式高保真还原**：
-  - 微信公众号在移动端使用内联 `<svg>` 矢量图形结合 `data-formula` 属性展现公式；
-  - 本插件深度遍历微信 DOM，完美解析行内公式与独立块级公式，并在长图中保留原貌，同时为大模型还原为标准 LaTeX 语法（`$...$` 与 `$$...$$`）。
-- 📑 **优雅的合并转发消息**：
-  - 不再用单张或多张大图刷屏群聊，自动打包为单个干净整洁的 QQ 合并转发卡片；
-  - **节点 1**：引导语与来源提示；
-  - **节点 2**：由大模型总结、结合 Markdown + KaTeX 引擎渲染的高颜值暗色卡片图；
-  - **节点 3+**：公众号原文 2 倍高清正文长图（保留完整图文排版）。
+- ⚡ **无公式极速纯文本模式 (New v1.3.0)**：
+  - 自动检测文章是否含有数学公式；
+  - **若文章没有数学公式**，自动跳过耗时的无头浏览器截图渲染，直接以合并转发形式发送**纯文本 AI 总结 + 原文分段文本**，响应提升 5 倍以上，秒级出结果！
+- 📐 **数学公式高保真长图还原**：
+  - **若文章包含数学公式**（微信内联 SVG 或 `data-formula` 属性），自动激活高保真渲染管线；
+  - 总结卡片使用 **Markdown + KaTeX** 渲染为专业暗色卡片图；正文输出 2 倍高清长图，行内与独立块级公式完美对齐排版。
+- 📑 **优雅的合并转发消息结构**：
+  - 彻底杜绝长图/大段文本在聊天窗口刷屏；
+  - **节点 1**：`以下是对微信公众号 <URL> 内容的解析和总结：`；
+  - **节点 2**：AI 深度精读总结（有公式为渲染卡片图，无公式为纯文本总结）；
+  - **后续节点**：公众号原文内容（有公式为高清长图切片，无公式为完整段落纯文本）。
 - 🖼️ **防盗链与懒加载还原**：
-  - 自动将微信 `data-src` 图片属性注入为真实 `src`，并注入 `<meta name="referrer" content="no-referrer">`，彻底解决图片裂图问题。
+  - 自动将微信 `data-src` 图片属性注入为真实 `src`，并注入 `<meta name="referrer" content="no-referrer">`，彻底防止裂图。
 - ✂️ **超长文章智能分段切片**：
-  - 若文章篇幅过长（高度超过 12,000px），自动使用高精度无缝切片，防止 QQ 移动端严重压缩模糊。
-- 🤖 **原生 LLM Agent 工具支持 (Function Calling)**：
-  - 不仅支持群聊自动识别链接与 `/wx <链接>` 指令，更注册了 `@filter.llm_tool`；
-  - 用户在群聊或私聊中 **@机器人 读一下这篇公众号文章** 时，大模型能够感知并自主调用该插件！
+  - 若长图高度超过阈值（默认 12,000px），自动使用 Pillow 进行高精度无缝切片，避免 QQ 移动端强行压缩模糊。
+- 🤖 **原生 LLM Agent 工具 (Function Calling)**：
+  - 注册 `@filter.llm_tool(name="read_wechat_article")`；
+  - 在群聊或私聊中 **@机器人 帮我看看这篇公众号讲了什么 <链接>** 时，大模型可自主感知并调用该工具。
 
 ---
 
@@ -47,10 +50,10 @@ git clone https://github.com/VesperaZephyr/astrbot_plugin_wechat_article.git
 
 ### 方式二：安装依赖
 
-本插件依赖 `beautifulsoup4`、`playwright`、`markdown` 和 `pillow`：
+本插件依赖 `beautifulsoup4`、`playwright`、`markdown`、`pillow` 与 `httpx`：
 
 ```bash
-pip install beautifulsoup4 playwright markdown pillow -i https://mirrors.aliyun.com/pypi/simple/
+pip install beautifulsoup4 playwright markdown pillow httpx -i https://mirrors.aliyun.com/pypi/simple/
 
 # 安装 Playwright 的 Chromium 内核
 PLAYWRIGHT_DOWNLOAD_HOST=https://npmmirror.com/mirrors/playwright/ python -m playwright install chromium
@@ -92,7 +95,8 @@ https://mp.weixin.qq.com/s/xxxxxx
 | 配置项 | 默认值 | 说明 |
 |---|---|---|
 | `enable_auto_detect` | `true` | 是否开启群聊/私聊链接自动识别 |
-| `render_mode` | `dual_image` | 内容展示形式：`dual_image`(双图合并转发) / `text_summary_with_image`(纯文本+长图) / `image_only` / `summary_only` |
+| `fast_text_when_no_formula` | `true` | **无公式文章启用快速纯文本模式**：跳过长图渲染直接合并转发纯文本+总结，秒级响应 |
+| `render_mode` | `dual_image` | 有公式时的展示形式：`dual_image`(双图合并转发) / `text_summary_with_image`(纯文本+长图) / `image_only` / `summary_only` |
 | `summary_style` | `academic_math` | AI 总结风格：`academic_math`(学术与数理精读) / `concise`(极简速读) / `detailed`(详细全面) |
 | `max_slice_height` | `12000` | 单张长图最大高度阈值（像素），超过自动进行智能无缝分段切片 |
 | `card_theme` | `dark` | 总结卡片配色主题：`dark`(暗色极客) / `light`(优雅浅白) |

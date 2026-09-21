@@ -5,8 +5,14 @@
     "default": true,
     "hint": "开启后，群聊或私聊中发送微信公众号文章链接将自动触发读取、长图与总结"
   },
+  "fast_text_when_no_formula": {
+    "description": "无公式文章启用快速纯文本合并转发",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，若文章没有数学公式，自动跳过耗时的 Playwright 浏览器渲染，直接以【纯文本+总结】的合并转发形式快速回复，响应提升5倍以上"
+  },
   "render_mode": {
-    "description": "内容展示与发送形式",
+    "description": "有公式时的展示形式",
     "type": "string",
     "default": "dual_image",
     "options": [
