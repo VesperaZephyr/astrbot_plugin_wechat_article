@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 微信公众号文章抓取与结构化提取模块
+支持精准提取图片说明文字与 LaTeX 数学公式
 """
 
 import re
@@ -75,7 +76,6 @@ class WeChatArticleFetcher:
             if og_title:
                 title = og_title.get("content", "").strip()
         if not title:
-            # 正则回退提取
             m = re.search(r'var msg_title = [\'"]([^\'"]+)[\'"]', html)
             if m:
                 title = m.group(1).strip()
@@ -108,31 +108,13 @@ class WeChatArticleFetcher:
             logger.error("[WeChatFetcher] 找不到正文 #js_content")
             return None
 
-        # 确保正文可见 (微信有时加 style="visibility: hidden")
         content_el["style"] = "visibility: visible !important;"
 
-        # 处理公式
+        # 处理公式统计
         formula_count = WeChatFormulaProcessor.process_for_rendering(content_el)
 
-        # 修复图片懒加载：将 data-src 复制到 src，并移除可能阻碍渲染的内联隐藏样式
-        for img in content_el.find_all("img"):
-            real_src = img.get("data-src") or img.get("data-original") or img.get("src")
-            if real_src:
-                img["src"] = real_src
-                # 微信防裂图样式
-                img["referrerpolicy"] = "no-referrer"
-                img["loading"] = "eager"
-            # 移除宽度为0的占位
-            img_style = img.get("style", "")
-            img_style += "; max-width: 100% !important; height: auto !important; display: block; margin: 10px auto;"
-            img["style"] = img_style
-
-        # 修复视频和音频卡片样式占位
-        for iframe in content_el.find_all(["iframe", "video"]):
-            iframe["referrerpolicy"] = "no-referrer"
-
-        # 提取供 LLM 阅读的含 LaTeX 的全文文本
-        llm_text = WeChatFormulaProcessor.extract_text_with_latex(content_el)
+        # 提取供 LLM 阅读的全文文本（包含图片说明与 LaTeX 公式）
+        llm_text = cls._extract_clean_text(content_el)
 
         return {
             "url": url,
@@ -144,3 +126,53 @@ class WeChatArticleFetcher:
             "full_text": llm_text,
             "char_count": len(llm_text),
         }
+
+    @classmethod
+    def _extract_clean_text(cls, soup: BeautifulSoup) -> str:
+        """
+        深层提取正文：
+        1. 保留图片描述文字 (alt, title, figcaption, 下方紧邻的说明)
+        2. 保留 LaTeX 数学公式
+        """
+        soup_copy = BeautifulSoup(str(soup), "html.parser")
+
+        # 1. 提取公式为 LaTeX 格式
+        for el in soup_copy.find_all(attrs={"data-formula": True}):
+            formula_type = el.get("data-formula-type", "")
+            latex_code = el.get("data-formula", "").strip()
+            if not latex_code:
+                continue
+
+            if formula_type == "inline-equation" or el.name == "span":
+                el.replace_with(f" ${latex_code}$ ")
+            else:
+                el.replace_with(f"\n\n$${latex_code}$$\n\n")
+
+        # 2. 提取图片说明文字
+        for img in soup_copy.find_all("img"):
+            desc_parts = []
+            alt = img.get("alt", "").strip()
+            if alt and alt != "图片":
+                desc_parts.append(alt)
+            title_attr = img.get("title", "").strip()
+            if title_attr:
+                desc_parts.append(title_attr)
+
+            # 寻找微信图片下方的 caption / 配图说明
+            parent = img.parent
+            if parent:
+                sibling = parent.find_next_sibling(["figcaption", "span", "p"])
+                if sibling:
+                    sib_text = sibling.get_text(strip=True)
+                    if 0 < len(sib_text) <= 50 and any(w in sib_text for w in ["图", "示意", "如图", "来源", "▲", "▼"]):
+                        desc_parts.append(sib_text)
+
+            desc = " - ".join(desc_parts) if desc_parts else "插图"
+            img.replace_with(f"\n[配图: {desc}]\n")
+
+        for tag in soup_copy(["script", "style", "noscript", "iframe"]):
+            tag.decompose()
+
+        text = soup_copy.get_text(separator="\n", strip=True)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        return text
