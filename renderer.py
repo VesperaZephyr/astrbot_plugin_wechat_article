@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
 Playwright 高清长图渲染引擎
-核心技术：
-1. 原文直接截图：直接导航微信公众号原网页 (page.goto) 截取，100% 还原微信官方原始排版与矢量 SVG 公式，零公式浮动，零图片丢失！
-2. 总结卡片渲染：采用 Markdown 公式防护 + 本地离线 MathJax 2.7.7 引擎，彻底消除公式乱码与下划线斜体破坏！
+核心突破：
+1. 原文直接截图：直接导航微信公众号原网页 (page.goto) 截取，100% 还原微信官方原始排版与插图、矢量 SVG 公式，零公式浮动，插图 100% 为真实图片！
+2. 总结卡片渲染：采用全覆盖 LaTeX 保护 (支持 $$, $, \\[, \\() + 本地离线 MathJax 2.7.7，彻底解决公式乱码与斜体误伤！
 """
 
 import os
@@ -27,28 +27,33 @@ OUTPUT_DIR = "/AstrBot/data/temp/wechat_article"
 # 本地离线 MathJax 路径
 LOCAL_MATHJAX_PATH = "/AstrBot/data/plugins/astrbot_plugin_mathsolve/vendor/md2img/mathjax-2.7.7/MathJax.js"
 
-# 数学公式防护正则
-_BLOCK_MATH_RE = re.compile(r'\$\$([\s\S]*?)\$\$')
-_INLINE_MATH_RE = re.compile(r'(?<!\$)\$([^\$\n]+?)\$(?!\$)')
+# 全覆盖数学公式正则：同时支持 $$, $, \[, \(
+_MATH_TOKEN_RE = re.compile(
+    r"(?<!\\)\$\$[\s\S]*?(?<!\\)\$\$|"
+    r"\\\[[\s\S]*?\\\]|"
+    r"\\\([^\n]*?\\\)|"
+    r"(?<!\\)\$[^\n]*?(?<!\\)\$"
+)
 
 def _protect_math_for_markdown(text: str) -> Tuple[str, List[str]]:
     """在 Markdown 解析前保护数学公式，避免被 _ * 等语法破坏"""
     pieces = []
-    def repl_block(m):
+    def repl(m):
         pieces.append(m.group(0))
-        return f"<!--MATH_BLOCK_{len(pieces)-1}-->"
-    def repl_inline(m):
-        pieces.append(m.group(0))
-        return f"<!--MATH_INLINE_{len(pieces)-1}-->"
-    text = _BLOCK_MATH_RE.sub(repl_block, text)
-    text = _INLINE_MATH_RE.sub(repl_inline, text)
+        return f"<!--MATH_TOKEN_{len(pieces)-1}-->"
+    text = _MATH_TOKEN_RE.sub(repl, text)
     return text, pieces
 
 def _restore_math_tokens(html: str, pieces: List[str]) -> str:
-    """Markdown 解析完成后安全恢复数学公式"""
+    """Markdown 解析完成后安全恢复数学公式，并标准化为 MathJax 可排版语法"""
     for i, piece in enumerate(pieces):
-        html = html.replace(f"<!--MATH_BLOCK_{i}-->", piece)
-        html = html.replace(f"<!--MATH_INLINE_{i}-->", piece)
+        normalized = piece
+        # 将 \[ \] 和 \( \) 规范化为 MathJax 识别的标准双美元符号与单美元符号
+        if normalized.startswith(r"\[") and normalized.endswith(r"\]"):
+            normalized = "$$" + normalized[2:-2] + "$$"
+        elif normalized.startswith(r"\(") and normalized.endswith(r"\)"):
+            normalized = "$" + normalized[2:-2] + "$"
+        html = html.replace(f"<!--MATH_TOKEN_{i}-->", normalized)
     return html
 
 async def get_browser() -> Browser:
@@ -203,14 +208,14 @@ class WeChatArticleRenderer:
         cls._ensure_output_dir()
         browser = await get_browser()
 
-        # 1. 保护公式
+        # 1. 保护全格式公式 ($$, $, \[, \()
         protected_md, pieces = _protect_math_for_markdown(summary_text)
 
         # 2. 解析 Markdown
         parser = mistune.create_markdown(escape=False, plugins=["table", "url", "strikethrough"])
         html_body = parser(protected_md)
 
-        # 3. 恢复公式
+        # 3. 恢复公式并标准化
         html_body = _restore_math_tokens(html_body, pieces)
 
         badge_info = f'<span class="badge">包含 {formula_count} 个数学公式</span>' if formula_count > 0 else '<span class="badge">深度精读</span>'
@@ -359,7 +364,6 @@ class WeChatArticleRenderer:
 </body>
 </html>"""
 
-        # 保存为本地 HTML 文件以解决 Chromium file:// 跨域加载安全限制
         uid = uuid.uuid4().hex[:8]
         tmp_html_path = os.path.join(OUTPUT_DIR, f"summary_page_{uid}.html")
         with open(tmp_html_path, "w", encoding="utf-8") as f:
@@ -382,7 +386,7 @@ class WeChatArticleRenderer:
                         MathJax.Hub.Queue(["Typeset", MathJax.Hub], () => resolve(true));
                     })""")
                 except Exception as e:
-                    logger.warning(f"[WeChatRenderer] MathJax Typeset wait failed/timed out: {e}")
+                    logger.warning(f"[WeChatRenderer] MathJax Typeset wait timed out: {e}")
 
             card_el = await page.query_selector("#summary-card") or await page.query_selector("body")
             box = await card_el.bounding_box()
@@ -392,7 +396,6 @@ class WeChatArticleRenderer:
             img_path = os.path.join(OUTPUT_DIR, f"wx_summary_{uid}.png")
             await card_el.screenshot(path=img_path, type="png")
 
-            # 清理临时 html
             try:
                 os.remove(tmp_html_path)
             except Exception:

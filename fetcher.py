@@ -113,6 +113,10 @@ class WeChatArticleFetcher:
         # 处理公式统计
         formula_count = WeChatFormulaProcessor.process_for_rendering(content_el)
 
+        # 统计正文真实插图数
+        images = content_el.find_all("img")
+        image_count = len([img for img in images if img.get("data-src") or img.get("src") or img.get("data-original")])
+
         # 提取供 LLM 阅读的全文文本（包含图片说明与 LaTeX 公式）
         llm_text = cls._extract_clean_text(content_el)
 
@@ -122,6 +126,7 @@ class WeChatArticleFetcher:
             "author": author,
             "publish_time": publish_time,
             "formula_count": formula_count,
+            "image_count": image_count,
             "content_html": str(content_el),
             "full_text": llm_text,
             "char_count": len(llm_text),

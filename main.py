@@ -151,6 +151,7 @@ class WeChatArticlePlugin(Star):
             author = article_data.get("author", "微信公众号")
             publish_time = article_data.get("publish_time", "")
             formula_count = article_data.get("formula_count", 0)
+            image_count = article_data.get("image_count", 0)
             full_text = article_data.get("full_text", "")
 
             # 2. 生成 AI 深度总结 (智能自适应：无公式绝不涉及数学)
@@ -171,10 +172,14 @@ class WeChatArticlePlugin(Star):
                 Node(content=[Plain(first_msg_text)], name=bot_name, uin=bot_uin)
             )
 
-            # 判断是否走【无公式极速纯文本模式】
+            # 智能判断：
+            # 1. 如果文章既无公式也无插图（纯文字通报/短讯），走超极速纯文本模式
+            # 2. 只要文章含有插图（如《原神》PV）或含有公式，原文必须使用微信原版高清长图，确保插图为真实高清图片、公式绝对零浮动！
+            has_media = (formula_count > 0 or image_count > 0)
             fast_text_mode = self.config.get("fast_text_when_no_formula", True)
-            if formula_count == 0 and fast_text_mode:
-                logger.info(f"[WeChatArticlePlugin] 文章无数学公式，触发【极速纯文本模式】")
+
+            if not has_media and fast_text_mode:
+                logger.info(f"[WeChatArticlePlugin] 文章无插图且无公式，走【纯文本极速合并转发】")
 
                 # 节点 2：纯文本精读总结 (无任何数学词汇)
                 summary_node_text = (
@@ -188,7 +193,7 @@ class WeChatArticlePlugin(Star):
                     Node(content=[Plain(summary_node_text)], name=f"AI 深度总结 · {author}", uin=bot_uin)
                 )
 
-                # 后续节点：正文纯文本分段（保留图注说明与完整段落）
+                # 后续节点：纯文本分段
                 chunks = self._split_text_to_chunks(full_text, max_chars=1800)
                 total_chunks = len(chunks)
                 for idx, chunk in enumerate(chunks, 1):
@@ -198,22 +203,36 @@ class WeChatArticlePlugin(Star):
                     )
 
             else:
-                logger.info(f"[WeChatArticlePlugin] 包含 {formula_count} 个数学公式，触发【原版高保真截图模式】")
+                logger.info(f"[WeChatArticlePlugin] 检测到公式数={formula_count}, 插图数={image_count}，走【原版高保真截图模式】")
 
-                # 节点 2：AI 总结卡片图 (本地离线渲染，彻底杜绝乱码)
-                summary_card_path = await WeChatArticleRenderer.render_markdown_summary_card(
-                    summary_text=md_summary_text,
-                    title=title,
-                    author=author,
-                    publish_time=publish_time,
-                    formula_count=formula_count
-                )
-                if summary_card_path and os.path.exists(summary_card_path):
+                # 节点 2：AI 总结
+                if formula_count > 0:
+                    # 数学文章：采用全覆盖 LaTeX 保护 + MathJax 离线渲染，彻底杜绝公式乱码
+                    summary_card_path = await WeChatArticleRenderer.render_markdown_summary_card(
+                        summary_text=md_summary_text,
+                        title=title,
+                        author=author,
+                        publish_time=publish_time,
+                        formula_count=formula_count
+                    )
+                    if summary_card_path and os.path.exists(summary_card_path):
+                        forward_nodes.append(
+                            Node(content=[Image.fromFileSystem(summary_card_path)], name=f"AI 深度总结导读 · {author}", uin=bot_uin)
+                        )
+                else:
+                    # 图文文章（无公式，如《原神》PV）：总结直接用纯文本节点，更清晰更直接，无任何公式乱码
+                    summary_node_text = (
+                        f"📑【AI 深度导读】《{title}》\n"
+                        f"👤 来源：{author}  "
+                        f"{f'📅 {publish_time}' if publish_time else ''}\n"
+                        f"{'-' * 35}\n"
+                        f"{md_summary_text}"
+                    )
                     forward_nodes.append(
-                        Node(content=[Image.fromFileSystem(summary_card_path)], name=f"AI 深度总结导读 · {author}", uin=bot_uin)
+                        Node(content=[Plain(summary_node_text)], name=f"AI 深度总结 · {author}", uin=bot_uin)
                     )
 
-                # 后续节点：直接对微信原网页进行 1:1 极清截图（公式绝对零浮动，图片 100% 原版呈现）
+                # 后续节点：直接对微信官方原网页进行 1:1 截图（插图 100% 真实，公式 100% 官方原汁原味）
                 max_slice_h = int(self.config.get("max_slice_height", 12000))
                 article_img_paths = await WeChatArticleRenderer.render_direct_wechat_article(
                     url=url,
