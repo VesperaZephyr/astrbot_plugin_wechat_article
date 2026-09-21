@@ -1,0 +1,65 @@
+{
+  "enable_auto_detect": {
+    "description": "启用公众号链接自动识别",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，群聊或私聊中发送微信公众号文章链接将自动触发读取、长图与总结"
+  },
+  "render_mode": {
+    "description": "内容展示与发送形式",
+    "type": "string",
+    "default": "dual_image",
+    "options": [
+      "dual_image",
+      "text_summary_with_image",
+      "image_only",
+      "summary_only"
+    ],
+    "hint": "dual_image(双图模式: AI总结卡片图 + 正文高清长图) / text_summary_with_image(纯文本总结 + 正文长图) / image_only(仅正文长图) / summary_only(仅AI总结)"
+  },
+  "summary_style": {
+    "description": "AI 总结风格",
+    "type": "string",
+    "default": "academic_math",
+    "options": [
+      "academic_math",
+      "concise",
+      "detailed"
+    ],
+    "hint": "academic_math(学术与数理精读: 重点提炼核心论点与公式推导) / concise(极简速读) / detailed(详尽全面)"
+  },
+  "max_slice_height": {
+    "description": "单张长图最大高度(像素)",
+    "type": "int",
+    "default": 12000,
+    "min": 4000,
+    "max": 25000,
+    "hint": "若文章极长超过此高度，将自动智能分段切片截图发送，防止 QQ 移动端严重压缩模糊"
+  },
+  "card_theme": {
+    "description": "总结卡片主题",
+    "type": "string",
+    "default": "dark",
+    "options": [
+      "dark",
+      "light"
+    ],
+    "hint": "总结卡片的视觉配色主题：暗色极客黑 / 优雅素雅白"
+  },
+  "access_mode": {
+    "description": "群聊访问控制模式",
+    "type": "string",
+    "default": "blacklist",
+    "options": [
+      "blacklist",
+      "whitelist"
+    ],
+    "hint": "blacklist(黑名单模式，名单内的群不触发) / whitelist(白名单模式，仅名单内的群触发)"
+  },
+  "group_list": {
+    "description": "群号列表(逗号分隔)",
+    "type": "string",
+    "default": "",
+    "hint": "黑名单或白名单的群号列表，用英文逗号分隔，如：123456,789012"
+  }
+}
