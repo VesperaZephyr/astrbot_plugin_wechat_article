@@ -7,6 +7,9 @@ Playwright 高清长图渲染引擎
 """
 
 import os
+import html
+from html import escape as escape_html
+from ._cooperation import render_job, close_resources
 import re
 import asyncio
 import logging
@@ -53,8 +56,21 @@ def _restore_math_tokens(html: str, pieces: List[str]) -> str:
             normalized = "$$" + normalized[2:-2] + "$$"
         elif normalized.startswith(r"\(") and normalized.endswith(r"\)"):
             normalized = "$" + normalized[2:-2] + "$"
-        html = html.replace(f"<!--MATH_TOKEN_{i}-->", normalized)
+        html = html.replace(f"<!--MATH_TOKEN_{i}-->", escape_html(normalized))
     return html
+
+async def close_browser():
+    global _GLOBAL_BROWSER, _GLOBAL_PLAYWRIGHT
+    async with _BROWSER_LOCK:
+        browser, driver = _GLOBAL_BROWSER, _GLOBAL_PLAYWRIGHT
+        _GLOBAL_BROWSER = _GLOBAL_PLAYWRIGHT = None
+        await close_resources(browser)
+        if driver is not None:
+            try:
+                await asyncio.wait_for(driver.stop(), timeout=5)
+            except Exception:
+                pass
+
 
 async def get_browser() -> Browser:
     """获取或初始化复用的 Playwright 浏览器实例"""
@@ -87,6 +103,7 @@ class WeChatArticleRenderer:
         os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     @classmethod
+    @render_job(close_browser)
     async def render_direct_wechat_article(cls, url: str, max_slice_height: int = 12000) -> List[str]:
         """
         直接通过 Playwright 访问微信公众号原网页进行 1:1 官方原版极清截图。
@@ -105,7 +122,12 @@ class WeChatArticleRenderer:
 
         try:
             logger.info(f"[WeChatRenderer] 开始导航微信原网页截图: {url}")
-            await page.goto(url, wait_until="networkidle", timeout=30000)
+            max_slice_height = max(1000, min(12000, int(max_slice_height)))
+            await page.goto(url, wait_until='domcontentloaded', timeout=30000)
+            if not await page.locator('#js_content').count():
+                raise ValueError('微信页面没有文章正文，可能是验证页或失效链接')
+            if not (await page.locator('#js_content').inner_text()).strip() and not await page.locator('#js_content img').count():
+                raise ValueError('微信文章正文为空')
 
             # 页面净化与懒加载图片唤醒
             await page.evaluate("""() => {
@@ -151,12 +173,18 @@ class WeChatArticleRenderer:
             }""")
 
             # 等待 2 秒让图片和 SVG 渲染完全稳定
-            await page.wait_for_timeout(2000)
+            await page.evaluate("""() => Promise.race([
+                Promise.all(Array.from(document.querySelectorAll('#js_content img')).map(img =>
+                    img.complete ? Promise.resolve() : new Promise(r => {img.onload = r; img.onerror = r}))),
+                new Promise(r => setTimeout(r, 8000))])""")
+            await page.evaluate("() => Promise.race([document.fonts.ready, new Promise(r => setTimeout(r, 3000))])")
 
             target_el = await page.query_selector("#img-content") or await page.query_selector(".rich_media_area_primary") or await page.query_selector("body")
             box = await target_el.bounding_box()
             target_h = int(box["height"]) if box else 2000
 
+            if target_h > 16000:
+                raise ValueError('文章截图过高，回退文字以避免浏览器内存不足')
             # 动态扩展高度
             await page.set_viewport_size({"width": 800, "height": target_h + 100})
 
@@ -189,23 +217,27 @@ class WeChatArticleRenderer:
                 return file_paths
 
         finally:
-            await page.close()
-            await context.close()
+            await close_resources(page, context)
 
     @classmethod
+    @render_job(close_browser)
     async def render_markdown_summary_card(
         cls,
         summary_text: str,
         title: str,
         author: str,
         publish_time: str = "",
-        formula_count: int = 0
+        formula_count: int = 0,
+        theme: str = "light"
     ) -> str:
         """
         基于 Markdown + 本地离线 MathJax 渲染 AI 深度总结卡片。
         彻底解决公式乱码、斜体误伤与文字错乱。
         """
         cls._ensure_output_dir()
+        title = html.escape(str(title))
+        author = html.escape(str(author))
+        publish_time = html.escape(str(publish_time))
         browser = await get_browser()
 
         # 1. 保护全格式公式 ($$, $, \[, \()
@@ -217,6 +249,13 @@ class WeChatArticleRenderer:
 
         # 3. 恢复公式并标准化
         html_body = _restore_math_tokens(html_body, pieces)
+        theme_css = ''
+        if theme == 'light':
+            theme_css = '''body{background:#f1f5f9!important;color:#0f172a!important}
+            .card{background:#fff!important;color:#0f172a!important;border-color:#dbe4ee!important}
+            .article-title,.md-body strong{color:#0f172a!important}
+            .md-body{color:#334155!important}
+            .md-body h1,.md-body h2,.md-body h3{color:#0369a1!important}'''
 
         badge_info = f'<span class="badge">包含 {formula_count} 个数学公式</span>' if formula_count > 0 else '<span class="badge">深度精读</span>'
 
@@ -341,6 +380,7 @@ class WeChatArticleRenderer:
     font-size: 12px;
     color: #64748b;
   }}
+{theme_css}
 </style>
 </head>
 <body>
@@ -383,6 +423,7 @@ class WeChatArticleRenderer:
                 try:
                     await page.wait_for_function("() => !!(window.MathJax && window.MathJax.Hub)", timeout=4000)
                     await page.evaluate("""() => new Promise((resolve) => {
+                        setTimeout(() => resolve(false), 8000);
                         MathJax.Hub.Queue(["Typeset", MathJax.Hub], () => resolve(true));
                     })""")
                 except Exception as e:
@@ -404,5 +445,4 @@ class WeChatArticleRenderer:
             return img_path
 
         finally:
-            await page.close()
-            await context.close()
+            await close_resources(page, context)

@@ -7,6 +7,8 @@
 """
 
 import uuid
+import asyncio
+from ._cooperation import resolve_provider_id
 import logging
 from typing import Dict, Any, Optional
 from astrbot.api.all import Context
@@ -66,6 +68,7 @@ class WeChatArticleSummarizer:
         context: Context,
         article_data: Dict[str, Any],
         style: str = "academic_math",
+        umo: Optional[str] = None,
     ) -> str:
         """
         调用 AstrBot 默认 LLM 生成高质量精读总结
@@ -84,37 +87,34 @@ class WeChatArticleSummarizer:
             system_prompt = GENERAL_ARTICLE_PROMPT
             article_type_hint = "该文章为普通文章，无数学公式，请以通俗、准确、贴合文章实际内容的风格总结。"
 
+        if style == 'concise':
+            system_prompt += '\n请简洁地列出三至五个要点，不要扩写。'
+        elif style == 'detailed':
+            system_prompt += '\n请详细解释已提供片段中的论点、证据和局限，不要补写未提供的内容。'
         # 限制文本长度为 4000 字符，秒级出结果
         max_chars = 4000
         truncated_text = full_text[:max_chars]
         if len(full_text) > max_chars:
-            truncated_text += "\n\n(注：正文篇幅较长，已截取核心段落进行总结...)"
+            truncated_text += "\n\n(注：正文篇幅较长，当前仅根据正文前 4000 字符生成导读，不代表全文结论。)"
 
         user_prompt = f"""文章标题：《{title}》
 公众号：{author}
 发布时间：{publish_time}
 文章特征：{article_type_hint}
 
-以下是文章核心正文内容：
+以下是实际提供给模型的正文片段：
 ----------------------------------------
 {truncated_text}
 ----------------------------------------
 请按照提示要求输出结构化精读总结。"""
 
         try:
-            provider = context.get_using_provider()
-            if not provider:
-                logger.error("[WeChatSummarizer] 未找到可用的 LLM Provider")
-                return cls._fallback_summary(article_data)
-
-            # 使用独立随机 session_id，避免历史累加延迟
-            fresh_session_id = f"wx_{uuid.uuid4().hex[:8]}"
-
-            response = await provider.text_chat(
+            provider_id = await resolve_provider_id(context, umo=umo)
+            response = await asyncio.wait_for(context.llm_generate(
+                chat_provider_id=provider_id,
                 prompt=user_prompt,
                 system_prompt=system_prompt,
-                session_id=fresh_session_id,
-            )
+            ), timeout=60)
 
             response_text = ""
             if hasattr(response, "completion_text"):
@@ -122,9 +122,9 @@ class WeChatArticleSummarizer:
             elif isinstance(response, str):
                 response_text = response
             else:
-                response_text = str(response)
+                response_text = ""
 
-            res = response_text.strip()
+            res = str(response_text or "").strip()
             if res.startswith("```markdown"):
                 res = res[len("```markdown"):].strip()
             elif res.startswith("```"):
@@ -132,7 +132,7 @@ class WeChatArticleSummarizer:
             if res.endswith("```"):
                 res = res[:-3].strip()
 
-            return res
+            return res or cls._fallback_summary(article_data)
 
         except Exception as e:
             logger.warning(f"[WeChatSummarizer] LLM 总结异常，使用兜底处理: {e}")
@@ -140,22 +140,5 @@ class WeChatArticleSummarizer:
 
     @classmethod
     def _fallback_summary(cls, article_data: Dict[str, Any]) -> str:
-        """兜底生成基础总结"""
-        title = article_data.get("title", "微信文章")
-        author = article_data.get("author", "微信公众号")
-        formula_count = article_data.get("formula_count", 0)
-
-        if formula_count > 0:
-            math_part = f"\n\n【📐 数理推导与核心模型】\n文章包含约 {formula_count} 个数学公式，原版高清排版已在后续消息展示。"
-        else:
-            math_part = ""
-
-        return f"""【🎯 核心主旨】
-《{title}》由公众号【{author}】发布，围绕核心论题展开了详尽论述。
-
-【📌 核心要点与关键脉络】
-1. 观点明确，论据层层推进。
-2. 完整内容已在后续合并转发消息中展示。{math_part}
-
-【💡 AI 导读点评】
-文章内容详实，已完成全文整理，适合收藏与阅读。"""
+        title = str(article_data.get('title') or '文章')
+        return f"《{title}》的 AI 导读暂时不可用。已保留实际抓取到的原文；以下内容不包含未经模型生成的评价或结论。"

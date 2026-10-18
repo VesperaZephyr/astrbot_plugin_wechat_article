@@ -15,6 +15,8 @@ from typing import Optional, List, AsyncGenerator
 from astrbot.api.star import Star, register
 from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
 from astrbot.api.message_components import Plain, Image, Node, Nodes
+from astrbot.api.event import MessageChain
+from ._cooperation import is_command_message, split_text, event_tool_serialized
 from astrbot.api.all import Context, AstrBotConfig
 
 from .fetcher import WeChatArticleFetcher
@@ -27,7 +29,7 @@ logger = logging.getLogger(__name__)
     name="astrbot_plugin_wechat_article",
     author="VesperaZephyr",
     desc="自动读取微信公众号文章全部内容，保留数学公式，合并转发微信原版高清长图与 Markdown 深度总结导读",
-    version="1.4.0",
+    version="1.6.0",
     repo="https://github.com/VesperaZephyr/astrbot_plugin_wechat_article"
 )
 class WeChatArticlePlugin(Star):
@@ -68,26 +70,33 @@ class WeChatArticlePlugin(Star):
             yield res
 
     @filter.llm_tool(name="read_wechat_article")
-    async def tool_read_wechat(self, event: AstrMessageEvent, url: str) -> AsyncGenerator[MessageEventResult, None]:
-        """读取微信公众号文章全部内容，保留数学公式，生成微信原版高清长图和AI总结导读，并以合并转发消息发送。当用户发送微信公众号文章链接(mp.weixin.qq.com)或要求读取、解析、总结微信公众号文章时必须调用此工具。
+    @event_tool_serialized('wechat_article')
+    async def tool_read_wechat(self, event: AstrMessageEvent, url: str = "") -> str:
+        """读取微信公众号文章，发送正文与导读，并返回可供模型判断的执行状态。
 
         Args:
-            url(string): 必填。微信公众号文章链接，必须是以 https://mp.weixin.qq.com/ 开头的完整URL。
+            url(string): 微信公众号文章的完整链接。
         """
-        urls = WeChatArticleFetcher.extract_urls(url or event.message_str)
+        if not self._is_group_allowed(event):
+            return "本群未允许使用公众号精读功能。"
+        urls = WeChatArticleFetcher.extract_urls(str(url or event.message_str or ""))
         if not urls:
-            yield event.plain_result(f"抱歉，未能在提供的参数中识别到合法的微信公众号文章链接：{url}")
-            return
+            return "未识别到合法的微信公众号文章链接，请提供 mp.weixin.qq.com 文章链接。"
+        if urls[0] in (event.get_extra('wechat_article_delivered_urls') or ()):
+            return "公众号文章已在当前消息中发送，请不要重复读取。"
+        status = ''
+        async for result in self._process_article(event, urls[0]):
+            await event.send(MessageChain(result.chain))
+            status = ' '.join(c.text for c in result.chain if isinstance(c, Plain)) or status
+        if urls[0] in (event.get_extra('wechat_article_delivered_urls') or ()):
+            return '公众号内容已发送。\n' + str(event.get_extra('wechat_article_tool_content') or '')
+        return status or "公众号文章未能发送成功，请检查链接或稍后重试。"
 
-        target_url = urls[0]
-        async for res in self._process_article(event, target_url):
-            yield res
-
-    @filter.event_message_type(filter.EventMessageType.ALL)
+    @filter.event_message_type(filter.EventMessageType.ALL, priority=60)
     async def auto_detect_wechat(self, event: AstrMessageEvent):
         """自动检测群聊/私聊中的微信文章链接"""
         raw_text = event.message_str or ""
-        if raw_text.strip().startswith("/"):
+        if is_command_message(event, raw_text) or getattr(event, "is_at_or_wake_command", False):
             return
 
         if not self.config.get("enable_auto_detect", True):
@@ -101,157 +110,98 @@ class WeChatArticlePlugin(Star):
             return
 
         target_url = urls[0]
-        if target_url in self._handling_urls:
+        key = (event.unified_msg_origin, target_url)
+        if key in self._handling_urls:
             return
 
-        self._handling_urls.add(target_url)
+        self._handling_urls.add(key)
         try:
             logger.info(f"[WeChatArticlePlugin] 自动检测到微信文章链接: {target_url}")
             async for res in self._process_article(event, target_url):
                 yield res
+            if event.get_extra('wechat_article_delivered'):
+                event.stop_event()
         finally:
-            self._handling_urls.discard(target_url)
+            self._handling_urls.discard(key)
 
     @staticmethod
     def _split_text_to_chunks(text: str, max_chars: int = 1800) -> List[str]:
-        """按自然段落拆分超长文本，每段不超过 max_chars"""
-        paragraphs = text.split("\n\n")
-        chunks = []
-        current = []
-        current_len = 0
-
-        for p in paragraphs:
-            p_clean = p.strip()
-            if not p_clean:
-                continue
-            if current_len + len(p_clean) > max_chars and current:
-                chunks.append("\n\n".join(current))
-                current = [p_clean]
-                current_len = len(p_clean)
-            else:
-                current.append(p_clean)
-                current_len += len(p_clean)
-
-        if current:
-            chunks.append("\n\n".join(current))
-        return chunks or [text]
+        return split_text(text, max_chars)
 
     async def _process_article(self, event: AstrMessageEvent, url: str):
-        """核心业务流程：抓取 -> 判断公式 -> 智能双轨路由 -> 合并转发发送"""
-        yield event.plain_result("📖 正在读取微信公众号文章内容，请稍候...")
-
+        delivered = set(event.get_extra('wechat_article_delivered_urls') or ())
+        if url in delivered:
+            yield event.plain_result('本条消息中的这篇公众号文章已发送。')
+            return
+        yield event.plain_result('📖 正在读取微信公众号文章内容，请稍候...')
         try:
-            # 1. 异步抓取文章信息与公式统计
-            article_data = await WeChatArticleFetcher.fetch_article(url)
-            if not article_data:
-                yield event.plain_result("❌ 抓取文章失败：无法获取微信正文内容，请检查链接是否有效。")
+            article = await WeChatArticleFetcher.fetch_article(url)
+            if not article:
+                yield event.plain_result('无法获取微信正文，请检查链接是否有效。')
                 return
-
-            title = article_data.get("title", "微信文章")
-            author = article_data.get("author", "微信公众号")
-            publish_time = article_data.get("publish_time", "")
-            formula_count = article_data.get("formula_count", 0)
-            image_count = article_data.get("image_count", 0)
-            full_text = article_data.get("full_text", "")
-
-            # 2. 生成 AI 深度总结 (智能自适应：无公式绝不涉及数学)
-            summary_style = self.config.get("summary_style", "academic_math")
-            md_summary_text = await WeChatArticleSummarizer.generate_markdown_summary(
-                context=self.context,
-                article_data=article_data,
-                style=summary_style,
-            )
-
-            bot_uin = str(event.get_self_id() or "10000")
-            bot_name = "公众号深度解析"
-            forward_nodes = []
-
-            # 节点 1：引导语与来源
-            first_msg_text = f"以下是对微信公众号 {url} 内容的解析和总结："
-            forward_nodes.append(
-                Node(content=[Plain(first_msg_text)], name=bot_name, uin=bot_uin)
-            )
-
-            # 智能判断：
-            # 1. 如果文章既无公式也无插图（纯文字通报/短讯），走超极速纯文本模式
-            # 2. 只要文章含有插图（如《原神》PV）或含有公式，原文必须使用微信原版高清长图，确保插图为真实高清图片、公式绝对零浮动！
-            has_media = (formula_count > 0 or image_count > 0)
-            fast_text_mode = self.config.get("fast_text_when_no_formula", True)
-
-            if not has_media and fast_text_mode:
-                logger.info(f"[WeChatArticlePlugin] 文章无插图且无公式，走【纯文本极速合并转发】")
-
-                # 节点 2：纯文本精读总结 (无任何数学词汇)
-                summary_node_text = (
-                    f"📑【AI 深度导读】《{title}》\n"
-                    f"👤 来源：{author}  "
-                    f"{f'📅 {publish_time}' if publish_time else ''}\n"
-                    f"{'-' * 35}\n"
-                    f"{md_summary_text}"
-                )
-                forward_nodes.append(
-                    Node(content=[Plain(summary_node_text)], name=f"AI 深度总结 · {author}", uin=bot_uin)
-                )
-
-                # 后续节点：纯文本分段
-                chunks = self._split_text_to_chunks(full_text, max_chars=1800)
-                total_chunks = len(chunks)
-                for idx, chunk in enumerate(chunks, 1):
-                    node_label = f"公众号原文 ({idx}/{total_chunks})" if total_chunks > 1 else "公众号原文"
-                    forward_nodes.append(
-                        Node(content=[Plain(chunk)], name=node_label, uin=bot_uin)
-                    )
-
-            else:
-                logger.info(f"[WeChatArticlePlugin] 检测到公式数={formula_count}, 插图数={image_count}，走【原版高保真截图模式】")
-
-                # 节点 2：AI 总结
-                if formula_count > 0:
-                    # 数学文章：采用全覆盖 LaTeX 保护 + MathJax 离线渲染，彻底杜绝公式乱码
-                    summary_card_path = await WeChatArticleRenderer.render_markdown_summary_card(
-                        summary_text=md_summary_text,
-                        title=title,
-                        author=author,
-                        publish_time=publish_time,
-                        formula_count=formula_count
-                    )
-                    if summary_card_path and os.path.exists(summary_card_path):
-                        forward_nodes.append(
-                            Node(content=[Image.fromFileSystem(summary_card_path)], name=f"AI 深度总结导读 · {author}", uin=bot_uin)
-                        )
+            title = article.get('title') or '微信文章'
+            author = article.get('author') or '微信公众号'
+            full_text = article.get('full_text') or ''
+            formula_count = article.get('formula_count') or 0
+            image_count = article.get('image_count') or 0
+            mode = self.config.get('render_mode', 'dual_image')
+            summary = ''
+            if mode != 'image_only':
+                summary = await WeChatArticleSummarizer.generate_markdown_summary(
+                    context=self.context, article_data=article,
+                    style=self.config.get('summary_style', 'academic_math'),
+                    umo=event.unified_msg_origin)
+            bot_uin = str(event.get_self_id() or '10000')
+            nodes = [Node(content=[Plain(f'《{title}》 · {author}\n来源：{url}')], name='公众号深度解析', uin=bot_uin)]
+            if summary:
+                card = ''
+                if mode == 'dual_image' and formula_count > 0:
+                    card = await self._safe_summary_card(summary_text=summary, title=title, author=author,
+                                                         publish_time=article.get('publish_time', ''),
+                                                         formula_count=formula_count,
+                                                         theme=self.config.get('card_theme', 'light'))
+                if card and os.path.exists(card):
+                    nodes.append(Node(content=[Image.fromFileSystem(card)], name='AI 深度导读', uin=bot_uin))
                 else:
-                    # 图文文章（无公式，如《原神》PV）：总结直接用纯文本节点，更清晰更直接，无任何公式乱码
-                    summary_node_text = (
-                        f"📑【AI 深度导读】《{title}》\n"
-                        f"👤 来源：{author}  "
-                        f"{f'📅 {publish_time}' if publish_time else ''}\n"
-                        f"{'-' * 35}\n"
-                        f"{md_summary_text}"
-                    )
-                    forward_nodes.append(
-                        Node(content=[Plain(summary_node_text)], name=f"AI 深度总结 · {author}", uin=bot_uin)
-                    )
+                    for chunk in self._split_text_to_chunks(summary):
+                        nodes.append(Node(content=[Plain(chunk)], name='AI 深度导读', uin=bot_uin))
+            if mode != 'summary_only':
+                images = []
+                fast = self.config.get('fast_text_when_no_formula', True) and not (formula_count or image_count)
+                if not fast or mode == 'image_only':
+                    images = await self._safe_article_images(url=url, max_slice_height=max(1000, min(12000, int(self.config.get('max_slice_height', 12000)))))
+                images = [path for path in images if os.path.exists(path)]
+                if images:
+                    for index, path in enumerate(images, 1):
+                        nodes.append(Node(content=[Image.fromFileSystem(path)], name=f'公众号原文 {index}/{len(images)}', uin=bot_uin))
+                elif full_text.strip():
+                    for chunk in self._split_text_to_chunks(full_text):
+                        nodes.append(Node(content=[Plain(chunk)], name='公众号原文（文字）', uin=bot_uin))
+                else:
+                    nodes.append(Node(content=[Plain('原文暂时无法截图，且没有可读取的正文，请打开来源链接查看。')], name='正文读取状态', uin=bot_uin))
+            yield event.chain_result([Nodes(nodes)])
+            delivered.add(url)
+            event.set_extra('wechat_article_delivered_urls', list(delivered))
+            event.set_extra('wechat_article_delivered', True)
+            event.set_extra('wechat_article_tool_content', f'标题：{title}\n来源：{url}\n实际导读：{summary[:6000]}' if summary else f'标题：{title}\n来源：{url}\n实际正文片段：{full_text[:6000]}')
+        except Exception as exc:
+            logger.error(f'[WeChatArticlePlugin] 处理文章异常: {exc}', exc_info=True)
+            yield event.plain_result(f'解析文章失败：{exc}')
 
-                # 后续节点：直接对微信官方原网页进行 1:1 截图（插图 100% 真实，公式 100% 官方原汁原味）
-                max_slice_h = int(self.config.get("max_slice_height", 12000))
-                article_img_paths = await WeChatArticleRenderer.render_direct_wechat_article(
-                    url=url,
-                    max_slice_height=max_slice_h
-                )
-                total_parts = len(article_img_paths)
-                for idx, p in enumerate(article_img_paths, 1):
-                    if os.path.exists(p):
-                        part_label = f"公众号原版解析 ({idx}/{total_parts})" if total_parts > 1 else "公众号原版解析"
-                        forward_nodes.append(
-                            Node(content=[Image.fromFileSystem(p)], name=part_label, uin=bot_uin)
-                        )
+    async def _safe_summary_card(self, **kwargs):
+        try:
+            return await WeChatArticleRenderer.render_markdown_summary_card(**kwargs)
+        except Exception as exc:
+            logger.warning("Summary card failed; retaining text: %s", exc)
+            return ''
 
-            # 发送合并转发
-            if forward_nodes:
-                yield event.chain_result([Nodes(forward_nodes)])
-            else:
-                yield event.plain_result("❌ 未能生成有效的合并转发节点内容。")
+    async def _safe_article_images(self, **kwargs):
+        try:
+            return await WeChatArticleRenderer.render_direct_wechat_article(**kwargs)
+        except Exception as exc:
+            logger.warning("Article screenshot failed; retaining source text: %s", exc)
+            return []
 
-        except Exception as e:
-            logger.error(f"[WeChatArticlePlugin] 处理文章异常: {e}", exc_info=True)
-            yield event.plain_result(f"❌ 解析文章时发生异常: {str(e)}")
+    async def terminate(self):
+        from .renderer import close_browser
+        await close_browser()
